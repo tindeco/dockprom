@@ -25,6 +25,7 @@ Prerequisites:
 Containers:
 
 * Prometheus (metrics database) `http://<host-ip>:9090`
+* Prometheus-Pushgateway (push acceptor for ephemeral and batch jobs) `http://<host-ip>:9091`
 * AlertManager (alerts management) `http://<host-ip>:9093`
 * Grafana (visualize metrics) `http://<host-ip>:3000`
 * NodeExporter (host metrics collector)
@@ -59,13 +60,13 @@ The Docker Host Dashboard shows key metrics for monitoring the resource usage of
 For storage and particularly Free Storage graph, you have to specify the fstype in grafana graph request.
 You can find it in `grafana/dashboards/docker_host.json`, at line 480 :
 
-      "expr": "sum(node_filesystem_free{fstype=\"btrfs\"})",
+      "expr": "sum(node_filesystem_free_bytes{fstype=\"btrfs\"})",
       
 I work on BTRFS, so i need to change `aufs` to `btrfs`.
 
 You can find right value for your system in Prometheus `http://<host-ip>:9090` launching this request :
 
-      node_filesystem_free
+      node_filesystem_free_bytes
 
 ***Docker Containers Dashboard***
 
@@ -141,7 +142,7 @@ ALERT monitor_service_down
 
 ***Docker Host alerts***
 
-Trigger an alert if the Docker host CPU is under hight load for more than 30 seconds:
+Trigger an alert if the Docker host CPU is under high load for more than 30 seconds:
 
 ```yaml
 ALERT high_cpu_load
@@ -160,7 +161,7 @@ Trigger an alert if the Docker host memory is almost full:
 
 ```yaml
 ALERT high_memory_load
-  IF (sum(node_memory_MemTotal) - sum(node_memory_MemFree + node_memory_Buffers + node_memory_Cached) ) / sum(node_memory_MemTotal) * 100 > 85
+  IF (sum(node_memory_MemTotal_bytes) - sum(node_memory_MemFree_bytes + node_memory_Buffers_bytes + node_memory_Cached_bytes) ) / sum(node_memory_MemTotal_bytes) * 100 > 85
   FOR 30s
   LABELS { severity = "warning" }
   ANNOTATIONS {
@@ -173,7 +174,7 @@ Trigger an alert if the Docker host storage is almost full:
 
 ```yaml
 ALERT hight_storage_load
-  IF (node_filesystem_size{fstype="aufs"} - node_filesystem_free{fstype="aufs"}) / node_filesystem_size{fstype="aufs"}  * 100 > 85
+  IF (node_filesystem_size_bytes{fstype="aufs"} - node_filesystem_free_bytes{fstype="aufs"}) / node_filesystem_size_bytes{fstype="aufs"}  * 100 > 85
   FOR 30s
   LABELS { severity = "warning" }
   ANNOTATIONS {
@@ -201,7 +202,7 @@ Trigger an alert if a container is using more than 10% of total CPU cores for mo
 
 ```yaml
  ALERT jenkins_high_cpu
-  IF sum(rate(container_cpu_usage_seconds_total{name="jenkins"}[1m])) / count(node_cpu{mode="system"}) * 100 > 10
+  IF sum(rate(container_cpu_usage_seconds_total{name="jenkins"}[1m])) / count(node_cpu_seconds_total{mode="system"}) * 100 > 10
   FOR 30s
   LABELS { severity = "warning" }
   ANNOTATIONS {
@@ -253,3 +254,94 @@ receivers:
 ```
 
 ![Slack Notifications](https://raw.githubusercontent.com/stefanprodan/dockprom/master/screens/Slack_Notifications.png)
+
+## Sending metrics to the Pushgateway
+
+The [pushgateway](https://github.com/prometheus/pushgateway) is used to collect data from batch jobs or from services.
+ 
+To push data, simply execute:
+
+    echo "some_metric 3.14" | curl --data-binary @- http://user:password@localhost:9091/metrics/job/some_job
+
+Please replace the `user:password` part with your user and password set in the initial configuration (default: `admin:admin`).
+
+## Updating Grafana to v5.2.2
+
+[In Grafana versions >= 5.1 the id of the grafana user has been changed](http://docs.grafana.org/installation/docker/#migration-from-a-previous-version-of-the-docker-container-to-5-1-or-later). Unfortunately this means that files created prior to 5.1 won’t have the correct permissions for later versions.
+
+| Version |   User  | User ID |
+|:-------:|:-------:|:-------:|
+|  < 5.1  | grafana |   104   |
+|  \>= 5.1 | grafana |   472   |
+
+There are two possible solutions to this problem.
+- Change ownership from 104 to 472
+- Start the upgraded container as user 104
+
+##### Specifying a user in docker-compose.yml
+
+To change ownership of the files run your grafana container as root and modify the permissions.
+
+First perform a `docker-compose down` then modify your docker-compose.yml to include the `user: root` option:
+
+```
+  grafana:
+    image: grafana/grafana:5.2.2
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/datasources
+      - ./grafana/dashboards:/etc/grafana/dashboards
+      - ./grafana/setup.sh:/setup.sh
+    entrypoint: /setup.sh
+    user: root
+    environment:
+      - GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    expose:
+      - 3000
+    networks:
+      - monitor-net
+    labels:
+      org.label-schema.group: "monitoring"
+```
+
+Perform a `docker-compose up -d` and then issue the following commands:
+
+```
+docker exec -it --user root grafana bash
+
+# in the container you just started:
+chown -R root:root /etc/grafana && \
+chmod -R a+r /etc/grafana && \
+chown -R grafana:grafana /var/lib/grafana && \
+chown -R grafana:grafana /usr/share/grafana
+```
+
+To run the grafana container as `user: 104` change your `docker-compose.yml` like such:
+
+```
+  grafana:
+    image: grafana/grafana:5.2.2
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/datasources
+      - ./grafana/dashboards:/etc/grafana/dashboards
+      - ./grafana/setup.sh:/setup.sh
+    entrypoint: /setup.sh
+    user: "104"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    expose:
+      - 3000
+    networks:
+      - monitor-net
+    labels:
+      org.label-schema.group: "monitoring"
+```
